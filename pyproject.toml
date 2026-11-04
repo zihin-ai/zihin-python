@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zihin"
-version = "0.1.0"
+version = "0.2.0"
 description = "Official Python client for invoking Zihin.ai hosted AI agents (buffered and streaming calls)."
 readme = "README.md"
 license = "MIT"
