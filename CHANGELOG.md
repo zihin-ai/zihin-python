@@ -23,7 +23,7 @@ October 2026). Minor because behaviour changes: turns that used to return now ra
 - `base_url` must be a Zihin domain unless `allow_custom_base_url=True`; `http://` requires
   `allow_http=True`; private, loopback and link-local addresses are refused (IPv6 by range).
 - Redirects are rejected instead of followed: a 3xx raises `network` with `retryable=False` and is
-  never retried. **Conscious divergence from the Node.js client**, where `redirect: 'error'` makes
+  never retried. Conscious divergence from the Node.js client, where `redirect: 'error'` makes
   fetch throw a retryable `network` error that a GET retries.
 - API key format checked as `zhn_(live|test|dev)_[A-Za-z0-9]{20,}`.
 - Retry policy: GET retries network errors, 408, 429 and 5xx; POST retries only 429/503 (with
@@ -69,6 +69,29 @@ October 2026). Minor because behaviour changes: turns that used to return now ra
 - No raw httpx/idna exception escapes: invalid URLs and non-string ids raise `config`, unexpected
   transport failures raise `network` (not retryable).
 - SSE decoding drops a leading BOM; `ZihinError` pickles.
+- After percent-decoding and IDNA, a host containing a WHATWG forbidden host code point (C0
+  controls, space, `# % / : < > ? @ [ \ ] ^ |`, DEL) is refused, and the rebuilt URL must parse
+  back to the validated host: `https://evil.com%2f.llm.zihin.ai` and IPv6 zone ids
+  (`[fe80::1%25eth0]`) raise `config`, as in the Node.js client.
+- `AgentStream.close()` from another thread releases a reader blocked in `next()` with
+  `ZihinError(kind="aborted")` (the equivalent of the Node.js `AbortSignal`).
+- `metadata` and the dispatch `payload` must be dicts; ids and the message must be valid Unicode (no
+  lone surrogates); the API key must be a string; the stream size limits must be positive integers.
+  All raise `config`.
+
+### Conscious divergences from the Node.js client
+
+- Redirects (see above): never retried.
+- Stricter URL parsing. Python refuses some URLs the WHATWG parser accepts: `https:/x`, `https:x`,
+  `https://llm.zihin.ai..`, `https://.llm.zihin.ai`, labels longer than 63 characters, and the IDNA
+  deviation characters (`ß`, `ς`, ZWNJ, ZWJ), which Python's IDNA2003 codec maps differently from
+  WHATWG's UTS46 (refusing them keeps both readings of the host identical). All raise `config`;
+  none is a Zihin endpoint.
+- `attachments[].type` is required here (the Node.js client only types it).
+- Deadline residuals, where the bound is per network operation instead of total: DNS resolution
+  (`getaddrinfo` cannot be interrupted) and waiting for the headers on a reused keep-alive
+  connection. Over HTTP/2 the socket is not shut down (it carries other requests' streams), so the
+  bound degrades to per read.
 - `Agent.tools_count`; SSE size limits (`max_stream_event_bytes`, `max_stream_total_bytes`);
   `on_retry` hook; `Literal` types for kinds and outcomes.
 

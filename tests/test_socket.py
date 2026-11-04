@@ -190,3 +190,101 @@ def test_with_block_closes_the_connection(server):
     while srv.closed_at is None and time.monotonic() < deadline:
         time.sleep(0.02)
     assert srv.closed_at is not None
+
+
+def test_close_from_another_thread_unblocks_the_reader_with_aborted(server):
+    def script(srv, conn):
+        conn.sendall(SSE_HEADERS + chunk(b'event: token\ndata: {"content": "a"}\n\n'))
+        srv.wait_for_client_close(conn, timeout=10)
+
+    srv = server(script)
+    events = client(srv).stream_agent("a", "Hi")
+    assert next(events).type == "token"
+    outcome = {}
+
+    def reader():
+        try:
+            next(events)
+            outcome["result"] = "event"
+        except ZihinError as err:
+            outcome["result"] = err.kind
+        outcome["at"] = time.monotonic()
+
+    th = threading.Thread(target=reader)
+    th.start()
+    time.sleep(0.3)  # the reader is now blocked in next()
+    closed = time.monotonic()
+    events.close()
+    th.join(timeout=2)
+    assert outcome.get("result") == "aborted"
+    assert outcome["at"] - closed <= 1.0
+    deadline = time.monotonic() + 1.0
+    while srv.closed_at is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert srv.closed_at is not None
+
+
+def test_close_from_another_thread_before_headers_aborts(server):
+    def script(srv, conn):
+        time.sleep(5)  # never answers in time
+
+    srv = server(script)
+    events = client(srv).stream_agent("a", "Hi")
+    outcome = {}
+
+    def reader():
+        try:
+            next(events)
+        except ZihinError as err:
+            outcome["result"] = err.kind
+        outcome["at"] = time.monotonic()
+
+    th = threading.Thread(target=reader)
+    th.start()
+    time.sleep(0.3)
+    closed = time.monotonic()
+    events.close()
+    th.join(timeout=2)
+    assert outcome.get("result") == "aborted" and outcome["at"] - closed <= 1.0
+
+
+def test_watchdog_cancel_wins_over_a_late_timer():
+    import zihin._http as zhttp
+
+    class FakeSock(socket.socket):
+        shut = False
+
+        def shutdown(self, how):  # pragma: no cover - must not be called
+            FakeSock.shut = True
+
+    wd = zhttp._Watchdog(0.05)
+    s = socket.socket()
+    try:
+        with wd._lock:
+            wd._sock = s
+        wd.cancel()
+        time.sleep(0.1)
+        wd._fire()  # a timer that fires after cancel() must not touch the socket
+        assert not wd.fired and wd._sock is None
+    finally:
+        s.close()
+
+
+def test_http2_responses_are_not_shut_down():
+    import httpx as _httpx
+
+    import zihin._http as zhttp
+
+    wd = zhttp._Watchdog(10)
+    s = socket.socket()
+    try:
+        with wd._lock:
+            wd._sock = s
+        res = _httpx.Response(200, extensions={"http_version": b"HTTP/2"})
+        wd.attach_response(res)
+        assert wd._sock is None
+        wd._fire()
+        assert wd.fired  # reported as timeout by the reader, but no shutdown on a shared socket
+    finally:
+        wd.cancel()
+        s.close()

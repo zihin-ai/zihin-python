@@ -64,6 +64,11 @@ ALLOWED_ZIHIN_DOMAINS = [
     "dev.llm.zihin.ai",
 ]
 
+#: WHATWG forbidden host code points (plus C0 controls, space and DEL), checked after decoding.
+_FORBIDDEN_HOST_RE = re.compile(r"[\x00-\x20#%/:<>?@\[\\\]^|\x7f]")
+_IPV6_CHARS_RE = re.compile(r"[0-9a-f:.]+", re.I)
+_IDNA_DEVIATIONS = ("\u00df", "\u03c2", "\u200c", "\u200d")
+
 _HEX_GROUP_RE = re.compile(r"[0-9a-f]{1,4}", re.I)
 _V4_TAIL_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3})$")
 
@@ -211,13 +216,28 @@ def validate_base_url(
         return UrlValidationResult(False, "Invalid URL format")
     if not scheme or not raw_host:
         return UrlValidationResult(False, "Invalid URL format")
-    raw_host = unquote(raw_host)
-    if ":" not in raw_host:  # IPv6 literals are already ASCII
+    if ":" in raw_host:
+        # Bracketed IPv6 literal. WHATWG accepts only hex digits, `:` and an embedded IPv4: no
+        # zone id (`[fe80::1%25eth0]`) and no percent-encoding.
+        if not _IPV6_CHARS_RE.fullmatch(raw_host) or _parse_ipv6(raw_host) is None:
+            return UrlValidationResult(False, "Invalid URL format")
+    else:
+        raw_host = unquote(raw_host)
+        # IDNA2003 (Python's codec) is transitional: it maps the four UTS46 "deviation" characters
+        # (ß, ς, ZWNJ, ZWJ) to other letters, while WHATWG keeps them. Refusing them keeps both
+        # readings of the host identical.
+        if any(c in raw_host for c in _IDNA_DEVIATIONS):
+            return UrlValidationResult(False, "Invalid URL format")
         try:
             raw_host = raw_host.encode("idna").decode("ascii").lower()
             # Punycode labels must decode (WHATWG rejects `xn--llm-zihin-ai`).
             raw_host.encode("ascii").decode("idna")
         except UnicodeError:
+            return UrlValidationResult(False, "Invalid URL format")
+        # After percent-decoding and IDNA, a forbidden host code point would be re-read as a
+        # delimiter when the URL is rebuilt: `https://evil.com%2f.llm.zihin.ai` would pass the
+        # whitelist as `evil.com/.llm.zihin.ai` and then connect to evil.com. WHATWG refuses them.
+        if _FORBIDDEN_HOST_RE.search(raw_host):
             return UrlValidationResult(False, "Invalid URL format")
 
     # Trailing dot: `localhost.` and `metadata.google.internal.` are valid FQDNs that resolve to the
@@ -232,7 +252,7 @@ def validate_base_url(
 
     is_localhost = hostname in ("localhost", "127.0.0.1", "::1")
     if is_localhost and allow_localhost:
-        return UrlValidationResult(True, sanitized_url=_rebuild(scheme, hostname, port, path))
+        return _accept(scheme, hostname, port, path)
 
     # 1. Protocol (HTTPS only by default)
     if not allow_http and scheme != "https":
@@ -261,7 +281,19 @@ def validate_base_url(
             False, "Only Zihin domains are allowed. Use 'allow_custom_base_url' for custom endpoints."
         )
 
-    return UrlValidationResult(True, sanitized_url=_rebuild(scheme, hostname, port, path))
+    return _accept(scheme, hostname, port, path)
+
+
+def _accept(scheme: str, hostname: str, port: Optional[int], path: str) -> UrlValidationResult:
+    """Belt and braces: the rebuilt URL must parse back to exactly the host that was validated."""
+    sanitized = _rebuild(scheme, hostname, port, path)
+    try:
+        reparsed = urlsplit(sanitized).hostname
+    except ValueError:
+        reparsed = None
+    if reparsed != hostname:
+        return UrlValidationResult(False, "Invalid URL format")
+    return UrlValidationResult(True, sanitized_url=sanitized)
 
 
 # ---------------------------------------------------------------------------------------------

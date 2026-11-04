@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence
 from urllib.parse import quote
@@ -17,7 +18,15 @@ import httpx
 
 from ._errors import ZihinError, error_from_response
 
-from ._http import DEADLINE_GRACE_MS, MAX_ERROR_BODY_BYTES, Transport, normalize_timeout, parse_body, to_json_body
+from ._http import (
+    DEADLINE_GRACE_MS,
+    MAX_ERROR_BODY_BYTES,
+    Transport,
+    _Watchdog,
+    normalize_timeout,
+    parse_body,
+    to_json_body,
+)
 from ._security import safe_id, safe_label, sanitize_message, validate_base_url, validate_prompt_size
 from ._sse import parse_sse
 from ._types import AgentResult, ErrorKind, IgnoredField, StreamEvent, Usage
@@ -356,6 +365,16 @@ def _validate_structured_input(p: InvokeParams) -> None:
             )
 
 
+def _require_encodable(value: Optional[str], name: str) -> None:
+    """A lone surrogate (e.g. ``"\\ud800"``) cannot be sent as UTF-8: refuse it before any work."""
+    if value is None:
+        return
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ZihinError("config", f"`{name}` is not valid Unicode text (lone surrogate).") from exc
+
+
 def validate_params(p: InvokeParams) -> None:
     if not isinstance(p.agent_id, str) or not p.agent_id:
         raise ZihinError("config", "agent_id is required (a non-empty string).")
@@ -367,6 +386,11 @@ def validate_params(p: InvokeParams) -> None:
         raise ZihinError("config", "Either `message` or `attachments` is required.")
     if p.message is not None and not isinstance(p.message, str):
         raise ZihinError("config", "`message` must be a string.")
+    _require_encodable(p.agent_id, "agent_id")
+    _require_encodable(p.message, "message")
+    _require_encodable(p.session_id, "session_id")
+    if p.metadata is not None and not isinstance(p.metadata, Mapping):
+        raise ZihinError("config", "`metadata` must be a dict.")
     if p.message:
         size_error = validate_prompt_size(p.message)
         if size_error:
@@ -492,6 +516,29 @@ _TURN_EVENTS = {
 }
 
 
+class _StreamControl:
+    """Shared between an AgentStream and its generator: the current attempt's watchdog."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._wd: Optional[_Watchdog] = None
+        self.aborted = False
+
+    def register(self, wd: _Watchdog) -> None:
+        with self._lock:
+            self._wd = wd
+            aborted = self.aborted
+        if aborted:
+            wd.abort()
+
+    def abort(self) -> None:
+        with self._lock:
+            self.aborted = True
+            wd = self._wd
+        if wd is not None:
+            wd.abort()
+
+
 class AgentStream:
     """The live events of one agent turn: an iterator you should close.
 
@@ -500,8 +547,9 @@ class AgentStream:
     not, until the object is garbage-collected. Closing twice is harmless.
     """
 
-    def __init__(self, gen: Iterator[StreamEvent]) -> None:
+    def __init__(self, gen: Iterator[StreamEvent], control: Optional[_StreamControl] = None) -> None:
         self._gen = gen
+        self._control = control or _StreamControl()
 
     def __iter__(self) -> "AgentStream":
         return self
@@ -510,9 +558,16 @@ class AgentStream:
         return next(self._gen)
 
     def close(self) -> None:
+        """Close the connection. Safe from another thread: if the reader is blocked in ``next()``,
+        the connection is shut down and the reader gets ``ZihinError(kind="aborted")`` (the
+        equivalent of the TS client's AbortSignal)."""
         close = getattr(self._gen, "close", None)
-        if close is not None:
+        if close is None:
+            return
+        try:
             close()
+        except ValueError:  # "generator already executing": the reader is in another thread
+            self._control.abort()
 
     def __enter__(self) -> "AgentStream":
         return self
@@ -538,11 +593,18 @@ def stream_events(t: Transport, raw: InvokeParams) -> AgentStream:
     reported_ms = caller_ms if caller_ms is not None else round(timeout * 1000)
     body = to_json_body(build_request_body(p, caller_ms), "request body")
     url = f"{t.base_url}/api/v2/agents/{quote(p.agent_id, safe='')}/stream"
-    return AgentStream(_stream(t, p, url, body, timeout, reported_ms))
+    control = _StreamControl()
+    return AgentStream(_stream(t, p, url, body, timeout, reported_ms, control), control)
 
 
 def _stream(
-    t: Transport, p: InvokeParams, url: str, body: bytes, timeout: float, reported_ms: int
+    t: Transport,
+    p: InvokeParams,
+    url: str,
+    body: bytes,
+    timeout: float,
+    reported_ms: int,
+    control: Optional[_StreamControl] = None,
 ) -> Iterator[StreamEvent]:
     # The check runs once: on `metadata`, or on the first turn event if it did not come.
     needs_capability = bool(_requested_input_fields(p)) or bool(p.consumer_key)
@@ -560,7 +622,14 @@ def _stream(
     # the pre-header retry happens without the key being honoured — acceptable by the same order,
     # and documented in the README. Unverified residue: a proxy that buffers headers and answers
     # 502/504 after the server already started.
-    opened = t.open_stream(url, body=body, timeout=timeout, reported_ms=reported_ms, idempotent=bool(p.client_message_id))
+    opened = t.open_stream(
+        url,
+        body=body,
+        timeout=timeout,
+        reported_ms=reported_ms,
+        idempotent=bool(p.client_message_id),
+        on_attempt=control.register if control is not None else None,
+    )
     res, endpoint = opened.response, opened.endpoint
     try:
         if res.status_code >= 400:

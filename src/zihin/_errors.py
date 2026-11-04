@@ -27,7 +27,7 @@ class ZihinError(Exception):
     - ``not_found``: the agent, trigger or execution does not exist or is not accessible
     - ``rate_limit``: too many requests
     - ``timeout``: the request, the stream or the agent turn timed out
-    - ``aborted``: cancelled by the caller (reserved for parity; the sync client does not raise it)
+    - ``aborted``: the stream was closed from another thread while a reader was waiting
     - ``server``: the Zihin server or the agent turn failed
     - ``network``: the connection failed
     - ``protocol``: the response was not what the API contract describes

@@ -68,6 +68,8 @@ class Zihin:
         http_client: Optional[httpx.Client] = None,
     ) -> None:
         key = api_key if api_key is not None else os.environ.get("ZIHIN_API_KEY", "")
+        if not isinstance(key, str):
+            raise ZihinError("config", "api_key must be a string.")
         if not key:
             raise ZihinError("config", "No API key. Pass api_key or set the ZIHIN_API_KEY environment variable.")
         key_error = validate_api_key_format(key)
@@ -88,6 +90,14 @@ class Zihin:
             raise ZihinError("config", "Invalid URL format") from exc
         if not isinstance(max_retries, int) or isinstance(max_retries, bool) or max_retries < 0:
             raise ZihinError("config", "max_retries must be a non-negative integer.")
+        for label, limit in (
+            ("max_stream_event_bytes", max_stream_event_bytes),
+            ("max_stream_total_bytes", max_stream_total_bytes),
+        ):
+            if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+                raise ZihinError("config", f"{label} must be a positive integer.")
+        if on_retry is not None and not callable(on_retry):
+            raise ZihinError("config", "on_retry must be callable.")
         self._owns_client = http_client is None
         self._http = http_client or httpx.Client()
         self._t = Transport(

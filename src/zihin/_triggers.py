@@ -38,6 +38,10 @@ def _q(value: str) -> str:
 def _require_id(value: Any, name: str) -> None:
     if not isinstance(value, str) or not value:
         raise ZihinError("config", f"{name} is required (a non-empty string).")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ZihinError("config", f"{name} is not valid Unicode text (lone surrogate).") from exc
 
 
 #: Statuses that mean "still running". The NON-terminal ones are listed on purpose: any new value
@@ -291,6 +295,8 @@ def dispatch_agent(t: Transport, trigger_id: str, payload: Optional[Mapping[str,
     """Fire a trigger. Async returns ``accepted`` + ``execution_id`` (202); sync also returns
     ``agent_response``/``usage``/``outcome`` (200)."""
     _require_id(trigger_id, "trigger_id")
+    if payload is not None and not isinstance(payload, Mapping):
+        raise ZihinError("config", "payload must be a dict.")
     status, text, endpoint, attempts = t.request_buffered(
         "POST",
         f"{t.base_url}/api/triggers/webhook/{_q(trigger_id)}",

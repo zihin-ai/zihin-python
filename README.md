@@ -59,7 +59,9 @@ Events are normalized: `metadata`, `status`, `phase`, `thinking`, `tool`, `actio
 the `response` event, which is what `invoke_agent` returns. Closing the stream (leaving the `with`
 block, or calling `events.close()`) closes the connection right away and cancels the turn on the
 server. A bare `break` out of a `for` loop does **not** close it until the stream object is
-garbage-collected, so prefer the `with` form. `stream_agent` yields the `error` event instead of
+garbage-collected, so prefer the `with` form. `close()` is safe from another thread: a reader
+blocked in `next()` is released at once with `ZihinError(kind="aborted")`, the equivalent of the
+Node.js client's `AbortSignal`. `stream_agent` yields the `error` event instead of
 raising; apply the same rules as `invoke_agent` with `error_from_stream_event(event, ...)` and
 `error_from_done_event(event, ...)`.
 
@@ -209,7 +211,7 @@ except ZihinError as err:
 | `network` | The connection failed |
 | `protocol` | The response did not match the API contract |
 | `unknown` | An unexpected HTTP status |
-| `aborted` | Reserved for parity with the Node.js client; the sync client does not raise it |
+| `aborted` | The stream was closed from another thread while a reader was waiting |
 
 The error also has `status`, `retryable`, `request_id`, `execution_id`, `session_id`, `endpoint`
 (`"POST host/path"`), `attempts` and, for a turn timeout, `timeout_clock`. Messages redact secrets
@@ -260,8 +262,11 @@ Zihin(
 
 - **Deadlines cover the whole operation**: connect, headers and the whole stream. httpx's own
   timeouts are per read, so a watchdog shuts the connection's socket down when the deadline expires
-  (a server that trickles bytes or goes silent after a keep-alive cannot stretch it). One residual:
-  while waiting for the headers on a reused keep-alive connection, the bound is per read. Defaults are per operation: stream
+  (a server that trickles bytes or goes silent after a keep-alive cannot stretch it). Two residuals,
+  where the bound is per network operation instead of total: DNS resolution (`getaddrinfo` cannot be
+  interrupted) and waiting for the headers on a reused keep-alive connection. Over HTTP/2 (only if
+  you inject an `httpx.Client(http2=True)`) the socket is never shut down, since it is shared by
+  other requests, so the bound is per read there as well. Defaults are per operation: stream
   200 s, trigger dispatch 260 s, short requests 35 s, each above the server's own budget, so the
   server's structured outcome (`TURN_TIMEOUT` with ids) arrives before the client gives up. Per call,
   `timeout_ms=` goes to the server as `options.timeout_ms` (it can only shorten the platform's
@@ -277,7 +282,8 @@ Zihin(
   private/loopback/link-local addresses are always refused (IPv4 in any notation, IPv6 by range,
   IPv4-mapped IPv6, cloud metadata hosts, trailing-dot names). Hosts are read the way the WHATWG
   URL parser (Node.js client and server) reads them: `\` as a path separator, percent-decoding and
-  IDNA mapping (full-width characters, ideographic dots). The same check applies to attachment and
+  IDNA mapping (full-width characters, ideographic dots); a host that still contains a delimiter
+  after decoding (`https://evil.com%2f.llm.zihin.ai`) is refused. The same check applies to attachment and
   trigger callback URLs (any domain allowed there, never a private address). The check is by host name, not by the
   resolved IP: with a custom base URL, a name that resolves to a private IP passes, so keep the
   whitelist in sensitive environments.

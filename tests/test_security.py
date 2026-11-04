@@ -178,3 +178,108 @@ def test_zihin_error_pickles():
         err.kind, err.code, err.status, err.request_id, err.retryable, err.message
     )
     assert str(back) == str(err)
+
+
+# -- second review: percent-decoded delimiters must never reach the rebuilt URL -------------------
+
+DELIMITER_SMUGGLING = [
+    "https://evil.com%2f.llm.zihin.ai",
+    "https://evil.com%2F.llm.zihin.ai",
+    "https://evil.com%23.llm.zihin.ai",
+    "https://evil.com%3f.llm.zihin.ai",
+    "https://evil.com%40.llm.zihin.ai",
+    "https://evil.com%5c.llm.zihin.ai",
+    "https://evil.com%3a443.llm.zihin.ai",
+    "https://evil.com%20.llm.zihin.ai",
+    "https://evil.com%00.llm.zihin.ai",
+    "https://evil.com%7c.llm.zihin.ai",
+    "https://evil.com%5e.llm.zihin.ai",
+    "https://evil.com%25.llm.zihin.ai",
+    "https://evil%3c.llm.zihin.ai",
+    "https://[fe80::1%25eth0]",
+    "https://[::1%25lo]",
+    "https://faß.llm.zihin.ai",  # IDNA2003/UTS46 deviation character
+]
+
+
+@pytest.mark.parametrize("url", DELIMITER_SMUGGLING)
+def test_smuggled_delimiters_are_refused_with_the_default_whitelist(url):
+    with pytest.raises(ZihinError) as exc:
+        Zihin(KEY, base_url=url)
+    assert exc.value.kind == "config"
+
+
+@pytest.mark.parametrize("url", DELIMITER_SMUGGLING)
+def test_smuggled_delimiters_are_refused_with_custom_domains(url):
+    with pytest.raises(ZihinError) as exc:
+        Zihin(KEY, base_url=url, allow_custom_base_url=True)
+    assert exc.value.kind == "config"
+
+
+@pytest.mark.parametrize("url", DELIMITER_SMUGGLING)
+def test_smuggled_delimiters_are_refused_in_attachments_and_callbacks(url):
+    rec = Recorder(httpx.Response(201, json={"data": {"id": "t"}}))
+    with pytest.raises(ZihinError) as exc:
+        make_client(rec).invoke_agent("a", "Hi", attachments=[{"url": url, "type": "image"}])
+    assert exc.value.kind == "config"
+    with pytest.raises(ZihinError) as exc:
+        make_client(rec).create_trigger("ag", "n", callback_url=url)
+    assert exc.value.kind == "config"
+    assert rec.requests == []
+
+
+def test_no_request_ever_leaves_for_a_host_outside_the_whitelist():
+    """End to end: whatever base_url the constructor accepts, every request goes to a Zihin host."""
+    candidates = DELIMITER_SMUGGLING + WHATWG_BYPASSES + [
+        "https://llm.zihin.ai",
+        "https://api.zihin.ai/",
+        "https://staging.llm.zihin.ai:8443/base",
+        "https://LLM.ZIHIN.AI.",
+        "https://user:pw@llm.zihin.ai",
+        "https://llm.zihin.ai\\@evil.com",
+        "https://evil.com#.llm.zihin.ai",
+        "https://evil.com?.llm.zihin.ai",
+        "https://evil.com\\.llm.zihin.ai",
+        "https://llm.zihin.ai%2f@evil.com",
+        "https://evil.com/.llm.zihin.ai",
+        "https://evil.com@llm.zihin.ai",
+    ]
+    hosts = []
+
+    def handler(request):
+        hosts.append(request.url.host)
+        return httpx.Response(200, json={"data": []})
+
+    accepted = 0
+    for url in candidates:
+        try:
+            z = Zihin(KEY, base_url=url, http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+        except ZihinError as err:
+            assert err.kind == "config"
+            continue
+        accepted += 1
+        z.list_agents()
+    assert accepted >= 5
+    allowed = {"llm.zihin.ai", "api.zihin.ai", "staging.llm.zihin.ai", "dev.llm.zihin.ai"}
+    assert hosts and all(h in allowed or h.endswith(tuple("." + d for d in allowed)) for h in hosts), hosts
+
+
+def test_rebuilt_url_must_reparse_to_the_validated_host():
+    from zihin._security import _accept
+
+    assert not _accept("https", "evil.com/.llm.zihin.ai", None, "").valid
+    assert _accept("https", "llm.zihin.ai", None, "/x").sanitized_url == "https://llm.zihin.ai/x"
+
+
+@pytest.mark.parametrize("kwargs", [{"max_stream_event_bytes": "x"}, {"max_stream_total_bytes": 0}, {"max_retries": -1}, {"on_retry": 5}])
+def test_constructor_limits_are_validated(kwargs):
+    with pytest.raises(ZihinError) as exc:
+        Zihin(KEY, **kwargs)
+    assert exc.value.kind == "config"
+
+
+@pytest.mark.parametrize("key", [5, b"zhn_live_aaaaaaaaaaaaaaaaaaaaaaaa"])
+def test_non_string_api_key_is_config(key):
+    with pytest.raises(ZihinError) as exc:
+        Zihin(key)  # type: ignore[arg-type]
+    assert exc.value.kind == "config"

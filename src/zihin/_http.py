@@ -179,20 +179,28 @@ MAX_ERROR_BODY_BYTES = 64 * 1024
 
 
 class _Watchdog:
-    """Enforces the TOTAL deadline of one attempt.
+    """Enforces the TOTAL deadline of one attempt, and the caller's abort.
 
     httpx timeouts are per network operation (connect, each read), so a server that trickles
     bytes, or sends one keep-alive just before the deadline and then goes silent, would keep a
-    blocking read alive well past it. When the timer expires, the connection's socket is shut down,
-    which makes a read blocked in the calling thread return at once; the caller sees ``fired`` and
-    reports a ``timeout``. The socket comes from httpcore's ``trace`` hook when a connection is
-    opened, and from ``network_stream`` once the headers arrived (covers reused connections for the
-    body phase). Residual: while waiting for the headers on a REUSED keep-alive connection there is
-    no socket handle yet, so that phase is bounded per read only.
+    blocking read alive well past it. When the timer expires (or ``abort()`` is called from another
+    thread), the connection's socket is shut down, which makes a read blocked in the reading thread
+    return at once; the reader then reports ``timeout`` (or ``aborted``). The socket comes from
+    httpcore's ``trace`` hook when a connection is opened, and from ``network_stream`` once the
+    headers arrived (covers reused connections for the body phase).
+
+    Residuals, bounded per read only: DNS resolution (``getaddrinfo`` cannot be interrupted), and
+    waiting for the headers on a REUSED keep-alive connection (no socket handle yet). Over HTTP/2
+    the socket is never shut down (it would kill multiplexed streams of other requests), so the
+    bound degrades to per read there too.
     """
 
-    def __init__(self, seconds: float) -> None:
+    def __init__(self, seconds: float, endpoint: str = "") -> None:
         self.fired = False
+        self.aborted = False
+        self._done = False
+        self._h2 = False
+        self._endpoint = endpoint
         self._lock = threading.Lock()
         self._sock: Optional[socket.socket] = None
         self._timer = threading.Timer(max(0.0, seconds), self._fire)
@@ -201,9 +209,20 @@ class _Watchdog:
 
     def trace(self, name: str, info: Dict[str, Any]) -> None:
         if name in ("connection.connect_tcp.complete", "connection.start_tls.complete"):
-            self._attach(info.get("return_value"))
+            stream = info.get("return_value")
+            if name.endswith("start_tls.complete") and _alpn(stream) == "h2":
+                with self._lock:
+                    self._h2 = True
+                    self._sock = None
+                return
+            self._attach(stream)
 
     def attach_response(self, res: httpx.Response) -> None:
+        if res.http_version == "HTTP/2":
+            with self._lock:
+                self._h2 = True
+                self._sock = None
+            return
         self._attach(res.extensions.get("network_stream"))
 
     def _attach(self, stream: Any) -> None:
@@ -214,17 +233,40 @@ class _Watchdog:
         if not isinstance(sock, socket.socket):
             return
         with self._lock:
+            if self._h2 or self._done:
+                return
             self._sock = sock
-            fired = self.fired
-        if fired:
+            kill = self.fired or self.aborted
+        if kill:
             self._shutdown(sock)
 
-    def _fire(self) -> None:
+    def _trip(self, *, abort: bool) -> None:
         with self._lock:
-            self.fired = True
+            if self._done:
+                return
+            if abort:
+                self.aborted = True
+            else:
+                self.fired = True
             sock = self._sock
         if sock is not None:
             self._shutdown(sock)
+
+    def _fire(self) -> None:
+        self._trip(abort=False)
+
+    def abort(self) -> None:
+        """Cancel from another thread: unblock the reader, which raises ``aborted``."""
+        self._trip(abort=True)
+
+    @property
+    def tripped(self) -> bool:
+        return self.fired or self.aborted
+
+    def error(self, expired: Callable[[], ZihinError]) -> ZihinError:
+        if self.aborted:
+            return ZihinError("aborted", "Stream aborted by the caller.", endpoint=self._endpoint or None, retryable=False)
+        return expired()
 
     @staticmethod
     def _shutdown(sock: socket.socket) -> None:
@@ -236,7 +278,20 @@ class _Watchdog:
             pass
 
     def cancel(self) -> None:
+        """Called BEFORE the response is closed, so a late timer can never shut down a socket that
+        went back to the pool and now serves another request."""
+        with self._lock:
+            self._done = True
+            self._sock = None
         self._timer.cancel()
+
+
+def _alpn(stream: Any) -> Optional[str]:
+    try:
+        ssl_object = stream.get_extra_info("ssl_object")
+        return ssl_object.selected_alpn_protocol() if ssl_object is not None else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 @dataclass
@@ -349,11 +404,11 @@ class Transport:
                 if max_bytes is not None and size >= max_bytes:
                     break
         except httpx.HTTPError as exc:
-            if wd.fired:
-                raise on_expired() from exc
+            if wd.tripped:
+                raise wd.error(on_expired) from exc
             raise
-        if wd.fired:
-            raise on_expired()
+        if wd.tripped:
+            raise wd.error(on_expired)
         data = b"".join(parts)
         if max_bytes is not None:
             data = data[:max_bytes]
@@ -386,14 +441,14 @@ class Transport:
             # FULL deadline on every attempt: it keeps the client above the server's budget even
             # after a retry. The loop only comes back here if the retry window allowed it.
             deadline_at = _now() + timeout
-            wd = _Watchdog(timeout)
+            wd = _Watchdog(timeout, endpoint)
             wait: Optional[float] = None
             try:
                 res = self._send(method, url, body, timeout, "application/json", wd, endpoint)
                 try:
                     wd.attach_response(res)
-                    if wd.fired or _now() > deadline_at:
-                        raise expired()
+                    if wd.tripped or _now() > deadline_at:
+                        raise wd.error(expired)
                     if 300 <= res.status_code < 400:
                         raise _redirect_error(endpoint, attempts)
                     if _should_retry_status(res.status_code, policy) and attempt < self.max_retries:
@@ -416,13 +471,14 @@ class Transport:
                         text = peeked if peeked is not None else self.read_text(res, deadline_at, expired, wd)
                         return res.status_code, text, endpoint, attempts
                 finally:
+                    wd.cancel()
                     res.close()
             except ZihinError:
                 # Errors WE classified inside the try pass straight through.
                 raise
             except httpx.HTTPError as exc:
-                if wd.fired or isinstance(exc, httpx.TimeoutException):
-                    raise expired() from exc
+                if wd.tripped or isinstance(exc, httpx.TimeoutException):
+                    raise wd.error(expired) from exc
                 last_error = error_from_network_exception(exc, endpoint=endpoint, attempts=attempts)
                 # A network error is only retryable on an idempotent method.
                 if not (policy == "idempotent" and last_error.retryable and attempt < self.max_retries):
@@ -447,6 +503,7 @@ class Transport:
         timeout: float,
         reported_ms: int,
         idempotent: bool,
+        on_attempt: Optional[Callable[["_Watchdog"], None]] = None,
     ) -> "OpenStream":
         """Open an SSE POST and return it with the response still open: the caller reads the
         stream inside the same deadline (enforced by the returned watchdog) and closes both.
@@ -468,13 +525,16 @@ class Transport:
             # FULL deadline per attempt; on the attempt that succeeds, this same clock (and its
             # watchdog) keeps covering the read of the whole stream.
             deadline_at = _now() + timeout
-            wd = _Watchdog(timeout)
+            wd = _Watchdog(timeout, endpoint)
+            if on_attempt is not None:
+                # Lets AgentStream.close() from another thread abort this attempt too.
+                on_attempt(wd)
             try:
                 res = self._send("POST", url, body, timeout, "text/event-stream", wd, endpoint)
             except httpx.HTTPError as exc:
                 wd.cancel()
-                if wd.fired or isinstance(exc, httpx.TimeoutException):
-                    raise expired() from exc
+                if wd.tripped or isinstance(exc, httpx.TimeoutException):
+                    raise wd.error(expired) from exc
                 # POST does not retry on a network error, unless it carries an idempotency key (the
                 # server dedupes), and then only if the backoff still fits the budget.
                 net = error_from_network_exception(exc, endpoint=endpoint, attempts=attempts)
@@ -496,8 +556,8 @@ class Transport:
             keep_open = False
             try:
                 wd.attach_response(res)
-                if wd.fired or _now() > deadline_at:
-                    raise expired()
+                if wd.tripped or _now() > deadline_at:
+                    raise wd.error(expired)
                 status = res.status_code
                 if 300 <= status < 400:
                     raise _redirect_error(endpoint, attempts)
@@ -522,13 +582,13 @@ class Transport:
                     return OpenStream(res, deadline_at, endpoint, wd, expired)
                 self._notify_retry(RetryInfo(endpoint, attempts, wait_s, "status", status))
             except httpx.HTTPError as exc:
-                if wd.fired or isinstance(exc, httpx.TimeoutException):
-                    raise expired() from exc
+                if wd.tripped or isinstance(exc, httpx.TimeoutException):
+                    raise wd.error(expired) from exc
                 raise error_from_network_exception(exc, endpoint=endpoint, attempts=attempts) from exc
             finally:
                 if not keep_open:
-                    res.close()
                     wd.cancel()
+                    res.close()
             _sleep_now(wait_s)
 
         raise ZihinError("unknown", "Max retries exceeded.", endpoint=endpoint)
@@ -545,20 +605,20 @@ class Transport:
             try:
                 chunk = next(it)
             except StopIteration:
-                if stream.watchdog.fired:
-                    raise timed_out() from None
+                if stream.watchdog.tripped:
+                    raise stream.watchdog.error(timed_out) from None
                 return
             except httpx.HTTPError as exc:
-                if stream.watchdog.fired or isinstance(exc, httpx.TimeoutException):
-                    raise timed_out() from exc
+                if stream.watchdog.tripped or isinstance(exc, httpx.TimeoutException):
+                    raise stream.watchdog.error(timed_out) from exc
                 # Not retryable: the server cancels the turn when it loses the connection and
                 # RELEASES the client_message_id, so a resend (even with the key) runs the turn, and
                 # its tools, again.
                 raise ZihinError(
                     "network", "Stream connection interrupted.", endpoint=endpoint, retryable=False
                 ) from exc
-            if stream.watchdog.fired or _now() > stream.deadline_at:
-                raise timed_out()
+            if stream.watchdog.tripped or _now() > stream.deadline_at:
+                raise stream.watchdog.error(timed_out)
             yield chunk
 
     # -- JSON helper --------------------------------------------------------------------------

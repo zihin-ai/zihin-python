@@ -458,3 +458,47 @@ def test_error_body_read_is_capped():
 def test_sse_with_bom_is_parsed():
     body = b"\xef\xbb\xbf" + sse(("response", {"content": "ok"}), ("done", {"outcome": "COMPLETED"}))
     assert make_client(Recorder(httpx.Response(200, content=body))).invoke_agent("a", "Hi").content == "ok"
+
+
+# -- second review: remaining raw exceptions -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"metadata": "abc"},
+        {"metadata": [1]},
+        {"message": "\ud800"},
+        {"session_id": "s-\udfff"},
+        {"context": {"a": "\ud800"}},
+        {"attachments": [{"url": "https://files.example.com/\ud800", "type": "image"}]},
+    ],
+)
+def test_more_invalid_input_is_config(kwargs):
+    rec = Recorder(ok_stream(("response", {"content": "x"})))
+    with pytest.raises(ZihinError) as exc:
+        args = {"message": "Hi", **kwargs}
+        make_client(rec).invoke_agent("a", **args)
+    assert exc.value.kind == "config" and rec.requests == []
+
+
+def test_agent_id_with_surrogate_is_config():
+    rec = Recorder(ok_stream(("response", {"content": "x"})))
+    with pytest.raises(ZihinError) as exc:
+        make_client(rec).invoke_agent("a\ud800", "Hi")
+    assert exc.value.kind == "config" and rec.requests == []
+
+
+@pytest.mark.parametrize("payload", [[1], "abc", 5])
+def test_dispatch_payload_must_be_a_mapping(payload):
+    rec = Recorder(httpx.Response(200, json={"success": True}))
+    with pytest.raises(ZihinError) as exc:
+        make_client(rec).dispatch_agent("t-1", payload)  # type: ignore[arg-type]
+    assert exc.value.kind == "config" and rec.requests == []
+
+
+def test_trigger_id_with_surrogate_is_config():
+    rec = Recorder(httpx.Response(200, json={"success": True}))
+    with pytest.raises(ZihinError) as exc:
+        make_client(rec).dispatch_agent("t\ud800")
+    assert exc.value.kind == "config" and rec.requests == []
