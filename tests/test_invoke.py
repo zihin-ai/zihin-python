@@ -383,3 +383,78 @@ def test_hostile_ids_are_dropped():
     assert err.execution_id is None and err.session_id is None and err.request_id is None
     assert err.code == "AGENT_ERROR"  # unsafe label dropped
     assert "zhn_live_" not in err.message and "[REDACTED]" in err.message
+
+
+# -- no raw exceptions ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("agent_id", [123, None, "", b"a"])
+def test_non_string_agent_id_is_config(agent_id):
+    rec = Recorder(ok_stream(("response", {"content": "x"})))
+    with pytest.raises(ZihinError) as exc:
+        make_client(rec).invoke_agent(agent_id, "Hi")
+    assert exc.value.kind == "config" and rec.requests == []
+
+
+def test_non_string_trigger_ids_are_config():
+    z = make_client(Recorder(httpx.Response(200, json={})))
+    for call in (lambda: z.dispatch_agent(123), lambda: z.get_execution("t", 5), lambda: z.get_trigger(None), lambda: z.create_trigger(1, "n", mode="sync")):
+        with pytest.raises(ZihinError) as exc:
+            call()
+        assert exc.value.kind == "config"
+
+
+def test_build_request_failure_is_config(monkeypatch):
+    z = make_client(Recorder(ok_stream(("response", {"content": "x"}))))
+
+    def boom(*a, **k):
+        raise httpx.InvalidURL("bad host")
+
+    monkeypatch.setattr(z._http, "build_request", boom)
+    with pytest.raises(ZihinError) as exc:
+        z.invoke_agent("a", "Hi")
+    assert exc.value.kind == "config"
+    with pytest.raises(ZihinError) as exc:
+        z.list_agents()
+    assert exc.value.kind == "config"
+
+
+def test_non_httpx_transport_failure_is_wrapped():
+    def handler(request):
+        raise UnicodeError("idna failure inside a custom transport")
+
+    with pytest.raises(ZihinError) as exc:
+        make_client(handler).invoke_agent("a", "Hi")
+    assert (exc.value.kind, exc.value.retryable) == ("network", False)
+
+
+# -- P2 ------------------------------------------------------------------------------------------
+
+
+def test_attachment_type_is_required_and_never_null():
+    rec = Recorder(ok_stream(("response", {"content": "x"})))
+    with pytest.raises(ZihinError) as exc:
+        make_client(rec).invoke_agent("a", None, attachments=[{"url": "https://files.example.com/a.png"}])
+    assert exc.value.kind == "config" and rec.requests == []
+    make_client(rec).invoke_agent("a", None, attachments=[{"url": "https://files.example.com/a.png", "type": "image"}])
+    assert rec.bodies[0]["attachments"] == [{"url": "https://files.example.com/a.png", "type": "image"}]
+
+
+def test_error_body_read_is_capped():
+    sent = []
+
+    class Huge(httpx.SyncByteStream):
+        def __iter__(self):
+            for _ in range(256):
+                sent.append(1)
+                yield b"x" * 8192  # 2 MiB in total if fully read
+
+    with pytest.raises(ZihinError) as exc:
+        make_client(Recorder(httpx.Response(400, stream=Huge()))).invoke_agent("a", "Hi")
+    assert exc.value.status == 400
+    assert len(sent) * 8192 <= 64 * 1024 + 8192
+
+
+def test_sse_with_bom_is_parsed():
+    body = b"\xef\xbb\xbf" + sse(("response", {"content": "ok"}), ("done", {"outcome": "COMPLETED"}))
+    assert make_client(Recorder(httpx.Response(200, content=body))).invoke_agent("a", "Hi").content == "ok"

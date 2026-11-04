@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import httpx
 
 from . import _triggers
 from ._errors import ZihinError, error_from_response
 from ._http import DEFAULT_MAX_RETRIES, RetryInfo, Transport, normalize_timeout, parse_body
-from ._invoke import InvokeParams, invoke, stream_events
+from ._invoke import AgentStream, InvokeParams, invoke, stream_events
 from ._security import DEFAULT_BASE_URL, validate_api_key_format, validate_base_url
 from ._sse import DEFAULT_MAX_EVENT_BYTES, DEFAULT_MAX_TOTAL_BYTES
 from ._types import (
@@ -23,7 +23,6 @@ from ._types import (
     ExecutionStatus,
     FindOrCreateResult,
     QueryExtraction,
-    StreamEvent,
     TriggerInfo,
     TriggerRef,
 )
@@ -82,6 +81,11 @@ class Zihin:
         )
         if not url_check.valid:
             raise ZihinError("config", url_check.error or "Invalid base URL.")
+        try:
+            # httpx applies IDNA 2008, stricter than the check above: fail here, not on first use.
+            httpx.URL(url_check.sanitized_url or DEFAULT_BASE_URL)
+        except Exception as exc:  # httpx.InvalidURL, idna errors
+            raise ZihinError("config", "Invalid URL format") from exc
         if not isinstance(max_retries, int) or isinstance(max_retries, bool) or max_retries < 0:
             raise ZihinError("config", "max_retries must be a non-negative integer.")
         self._owns_client = http_client is None
@@ -166,11 +170,12 @@ class Zihin:
         attachments: Optional[Sequence[Attachment]] = None,
         timeout_ms: Optional[float] = None,
         metadata: Optional[Mapping[str, Any]] = None,
-    ) -> Iterator[StreamEvent]:
+    ) -> AgentStream:
         """Run one agent turn and yield its normalized events as they arrive.
 
-        Arguments are validated immediately; the connection opens on the first iteration. Closing
-        the iterator early closes the connection, which cancels the turn on the server. An
+        Arguments are validated immediately; the connection opens on the first iteration. Use it
+        as a context manager (``with zihin.stream_agent(...) as events:``) or call
+        ``events.close()``: closing closes the connection, which cancels the turn on the server. An
         ``error`` event is yielded like any other; use :func:`zihin.error_from_stream_event` and
         :func:`zihin.error_from_done_event` to apply the same rules as :meth:`invoke_agent`.
         The capability check (fields the server did not accept) raises ``ZihinError('config')``

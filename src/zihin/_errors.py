@@ -69,11 +69,23 @@ class ZihinError(Exception):
             retryable if retryable is not None else kind in ("rate_limit", "server", "network")
         )
 
+    def __reduce__(self) -> Any:
+        # The constructor composes the message, so rebuild from the state instead of re-running it
+        # (errors cross process boundaries in multiprocessing/celery workers).
+        return (_restore_error, (type(self), self.args, self.__dict__.copy()))
+
     def __repr__(self) -> str:
         return (
             f"ZihinError(kind={self.kind!r}, code={self.code!r}, status={self.status!r}, "
             f"retryable={self.retryable!r}, message={self.message!r})"
         )
+
+
+def _restore_error(cls: Any, args: Any, state: Dict[str, Any]) -> "ZihinError":
+    obj = cls.__new__(cls)
+    Exception.__init__(obj, *args)
+    obj.__dict__.update(state)
+    return obj  # type: ignore[no-any-return]
 
 
 def _build_message(

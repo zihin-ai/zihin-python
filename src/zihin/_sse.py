@@ -34,7 +34,8 @@ def parse_sse(
     data are skipped; comment lines (keep-alives) are ignored; ``id``/``retry`` are ignored (this
     client does not reconnect).
     """
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    # `utf-8-sig` drops a leading BOM, as the TS client's `TextDecoder` does.
+    decoder = codecs.getincrementaldecoder("utf-8-sig")(errors="replace")
     buffer = ""
     event = ""
     data: List[str] = []

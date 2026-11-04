@@ -13,8 +13,11 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence
 from urllib.parse import quote
 
+import httpx
+
 from ._errors import ZihinError, error_from_response
-from ._http import DEADLINE_GRACE_MS, Transport, normalize_timeout, parse_body, to_json_body
+
+from ._http import DEADLINE_GRACE_MS, MAX_ERROR_BODY_BYTES, Transport, normalize_timeout, parse_body, to_json_body
 from ._security import safe_id, safe_label, sanitize_message, validate_base_url, validate_prompt_size
 from ._sse import parse_sse
 from ._types import AgentResult, ErrorKind, IgnoredField, StreamEvent, Usage
@@ -354,8 +357,12 @@ def _validate_structured_input(p: InvokeParams) -> None:
 
 
 def validate_params(p: InvokeParams) -> None:
-    if not p.agent_id:
-        raise ZihinError("config", "agent_id is required.")
+    if not isinstance(p.agent_id, str) or not p.agent_id:
+        raise ZihinError("config", "agent_id is required (a non-empty string).")
+    if p.session_id is not None and not isinstance(p.session_id, str):
+        raise ZihinError("config", "`session_id` must be a string.")
+    if p.attachments is not None and not isinstance(p.attachments, (list, tuple)):
+        raise ZihinError("config", "`attachments` must be a list of `{\"url\", \"type\"}` dicts.")
     if not p.message and not p.attachments:
         raise ZihinError("config", "Either `message` or `attachments` is required.")
     if p.message is not None and not isinstance(p.message, str):
@@ -370,7 +377,11 @@ def validate_params(p: InvokeParams) -> None:
     # Defense in depth: attachments come from the user and the server fetches them (server-side
     # fetch). HTTPS + no private IP; any domain.
     for att in p.attachments or []:
-        check = validate_base_url(_s(_d(att).get("url")) or "\x00", allow_custom_domains=True)
+        a = _d(att)
+        # `type` is required by the contract (`image` | `audio` | `document`); never sent as null.
+        if not isinstance(a.get("url"), str) or not isinstance(a.get("type"), str) or not a["type"]:
+            raise ZihinError("config", 'Each attachment needs a `url` and a `type` (e.g. `{"url": ..., "type": "image"}`).')
+        check = validate_base_url(a["url"], allow_custom_domains=True)
         if not check.valid:
             raise ZihinError("config", f"Invalid attachment URL: {check.error}")
 
@@ -481,8 +492,43 @@ _TURN_EVENTS = {
 }
 
 
-def stream_events(t: Transport, raw: InvokeParams) -> Iterator[StreamEvent]:
-    """Validate eagerly, then return a generator that opens the stream on first iteration."""
+class AgentStream:
+    """The live events of one agent turn: an iterator you should close.
+
+    The connection opens on the first ``next()``. ``close()`` (or leaving a ``with`` block) closes
+    it at once, which cancels the turn on the server; a plain ``break`` out of a ``for`` loop does
+    not, until the object is garbage-collected. Closing twice is harmless.
+    """
+
+    def __init__(self, gen: Iterator[StreamEvent]) -> None:
+        self._gen = gen
+
+    def __iter__(self) -> "AgentStream":
+        return self
+
+    def __next__(self) -> StreamEvent:
+        return next(self._gen)
+
+    def close(self) -> None:
+        close = getattr(self._gen, "close", None)
+        if close is not None:
+            close()
+
+    def __enter__(self) -> "AgentStream":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def stream_events(t: Transport, raw: InvokeParams) -> AgentStream:
+    """Validate eagerly, then return a stream that opens the connection on first iteration."""
     p = raw.snapshot()
     validate_params(p)
     # The caller's `timeout_ms` is the ceiling the server must respect (sent as
@@ -492,7 +538,7 @@ def stream_events(t: Transport, raw: InvokeParams) -> Iterator[StreamEvent]:
     reported_ms = caller_ms if caller_ms is not None else round(timeout * 1000)
     body = to_json_body(build_request_body(p, caller_ms), "request body")
     url = f"{t.base_url}/api/v2/agents/{quote(p.agent_id, safe='')}/stream"
-    return _stream(t, p, url, body, timeout, reported_ms)
+    return AgentStream(_stream(t, p, url, body, timeout, reported_ms))
 
 
 def _stream(
@@ -514,17 +560,17 @@ def _stream(
     # the pre-header retry happens without the key being honoured — acceptable by the same order,
     # and documented in the README. Unverified residue: a proxy that buffers headers and answers
     # 502/504 after the server already started.
-    res, deadline_at, endpoint = t.open_stream(
-        url, body=body, timeout=timeout, reported_ms=reported_ms, idempotent=bool(p.client_message_id)
-    )
+    opened = t.open_stream(url, body=body, timeout=timeout, reported_ms=reported_ms, idempotent=bool(p.client_message_id))
+    res, endpoint = opened.response, opened.endpoint
     try:
         if res.status_code >= 400:
+            # Bounded and inside the deadline: an error body is small JSON, a hostile one is not.
             try:
-                text = res.read().decode("utf-8", errors="replace")
-            except Exception:  # noqa: BLE001
+                text = t.read_text(res, opened.deadline_at, opened.expired, opened.watchdog, MAX_ERROR_BODY_BYTES)
+            except httpx.HTTPError:
                 text = ""
             raise error_from_response(res.status_code, parse_body(text), endpoint=endpoint)
-        chunks = t.iter_stream(res, deadline_at, reported_ms, endpoint)
+        chunks = t.iter_stream(opened, reported_ms)
         for name, data in parse_sse(
             chunks, max_event_bytes=t.max_stream_event_bytes, max_total_bytes=t.max_stream_total_bytes
         ):
@@ -545,7 +591,7 @@ def _stream(
                     needs_capability = False
             yield event
     finally:
-        res.close()
+        opened.close()
 
 
 # ---------------------------------------------------------------------------------------------

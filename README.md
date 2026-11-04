@@ -41,13 +41,14 @@ with Zihin() as zihin:
 ### Streaming
 
 ```python
-for event in zihin.stream_agent("AGENT_ID", "Hello"):
-    if event.type == "token":
-        print(event.content, end="", flush=True)
-    elif event.type == "tool":
-        print("\n[tool]", event.tool, event.success)
-    elif event.type == "action_proposed":
-        print("\n[needs approval]", event.data)
+with zihin.stream_agent("AGENT_ID", "Hello") as events:
+    for event in events:
+        if event.type == "token":
+            print(event.content, end="", flush=True)
+        elif event.type == "tool":
+            print("\n[tool]", event.tool, event.success)
+        elif event.type == "action_proposed":
+            print("\n[needs approval]", event.data)
 ```
 
 Events are normalized: `metadata`, `status`, `phase`, `thinking`, `tool`, `action_proposed`,
@@ -55,8 +56,10 @@ Events are normalized: `metadata`, `status`, `phase`, `thinking`, `tool`, `actio
 `unknown` for event types this version does not know (the raw name is in `event.event`).
 
 `token` events are the model's working text across iterations. The answer the agent delivers is
-the `response` event, which is what `invoke_agent` returns. Stopping the iteration early closes the
-connection and cancels the turn on the server. `stream_agent` yields the `error` event instead of
+the `response` event, which is what `invoke_agent` returns. Closing the stream (leaving the `with`
+block, or calling `events.close()`) closes the connection right away and cancels the turn on the
+server. A bare `break` out of a `for` loop does **not** close it until the stream object is
+garbage-collected, so prefer the `with` form. `stream_agent` yields the `error` event instead of
 raising; apply the same rules as `invoke_agent` with `error_from_stream_event(event, ...)` and
 `error_from_done_event(event, ...)`.
 
@@ -255,7 +258,10 @@ Zihin(
 )
 ```
 
-- **Deadlines cover the whole operation**, stream included. Defaults are per operation: stream
+- **Deadlines cover the whole operation**: connect, headers and the whole stream. httpx's own
+  timeouts are per read, so a watchdog shuts the connection's socket down when the deadline expires
+  (a server that trickles bytes or goes silent after a keep-alive cannot stretch it). One residual:
+  while waiting for the headers on a reused keep-alive connection, the bound is per read. Defaults are per operation: stream
   200 s, trigger dispatch 260 s, short requests 35 s, each above the server's own budget, so the
   server's structured outcome (`TURN_TIMEOUT` with ids) arrives before the client gives up. Per call,
   `timeout_ms=` goes to the server as `options.timeout_ms` (it can only shorten the platform's
@@ -269,7 +275,10 @@ Zihin(
 - **Redirects are rejected**, not followed: a 3xx to another host would leak the API key.
 - **SSRF guard**: the base URL must be a Zihin domain unless `allow_custom_base_url=True`, and
   private/loopback/link-local addresses are always refused (IPv4 in any notation, IPv6 by range,
-  IPv4-mapped IPv6, cloud metadata hosts, trailing-dot names). The check is by host name, not by the
+  IPv4-mapped IPv6, cloud metadata hosts, trailing-dot names). Hosts are read the way the WHATWG
+  URL parser (Node.js client and server) reads them: `\` as a path separator, percent-decoding and
+  IDNA mapping (full-width characters, ideographic dots). The same check applies to attachment and
+  trigger callback URLs (any domain allowed there, never a private address). The check is by host name, not by the
   resolved IP: with a custom base URL, a name that resolves to a private IP passes, so keep the
   whitelist in sensitive environments.
 - **Memory limits**: `max_stream_event_bytes` (1 MB) and `max_stream_total_bytes` (64 MB); exceeding
@@ -300,6 +309,11 @@ An agent turn costs LLM tokens on your Zihin workspace.
   `content_source == "tokens"` instead of raising `protocol`.
 - `StreamEvent.type` is `unknown` for unrecognized events (the raw name is in `event`), and
   `ZihinError.message` now includes the endpoint, attempts and ids.
+- `stream_agent` returns an `AgentStream` (iterable, with `close()` and `with` support) instead of a
+  bare generator.
+- `AgentResult` gained fields in the middle (the second positional field is now `content_source`):
+  build it with keyword arguments.
+- Each attachment needs a `type` (`image`, `audio` or `document`).
 
 ## Development
 

@@ -90,8 +90,9 @@ def test_redirect_is_rejected_and_not_followed():
     assert (exc.value.kind, exc.value.retryable) == ("network", False)
     assert len(rec.requests) == 1
     rec = Recorder(httpx.Response(307, headers={"Location": "https://evil.example/"}))
-    with pytest.raises(ZihinError):
+    with pytest.raises(ZihinError) as exc:
         make_client(rec).invoke_agent("a", "Hi")
+    assert (exc.value.kind, exc.value.retryable) == ("network", False)
     assert [str(r.url.host) for r in rec.requests] == ["llm.zihin.ai"]
 
 
@@ -101,9 +102,9 @@ def test_redirect_rejected_even_when_the_injected_client_follows_redirects():
     from conftest import KEY
 
     z = Zihin(KEY, http_client=httpx.Client(transport=httpx.MockTransport(rec), follow_redirects=True))
-    with pytest.raises(ZihinError):
+    with pytest.raises(ZihinError) as exc:
         z.list_agents()
-    assert len(rec.requests) == 1
+    assert exc.value.kind == "network" and len(rec.requests) == 1
 
 
 def test_stream_deadline_covers_the_whole_stream(monkeypatch):

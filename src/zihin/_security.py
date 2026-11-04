@@ -10,7 +10,7 @@ import re
 import socket
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 DEFAULT_BASE_URL = "https://llm.zihin.ai"
 
@@ -144,19 +144,20 @@ _IPV4_NUMBERISH_RE = re.compile(r"[0-9a-fx.]+", re.I)
 _IPV4_LAST_PART_RE = re.compile(r"(0x[0-9a-f]*|[0-9]+)", re.I)
 
 
-def _normalize_ipv4(host: str) -> str:
+def _normalize_ipv4(host: str) -> Optional[str]:
     """Normalize IPv4 written in octal/hex/decimal/short form (``0177.0.0.1``, ``0x7f.1``,
     ``2130706433``) to dotted decimal, as the WHATWG URL parser does in the TS client. Without
-    this, Python's ``urlsplit`` would hand the private-range check the raw spelling."""
+    this, Python's ``urlsplit`` would hand the private-range check the raw spelling. Returns
+    ``None`` when the host ends in a number but is not a valid IPv4 (WHATWG rejects the URL)."""
     if not _IPV4_NUMBERISH_RE.fullmatch(host):
         return host
-    last = host.rstrip(".").rsplit(".", 1)[-1]
+    last = host.rsplit(".", 1)[-1]
     if not _IPV4_LAST_PART_RE.fullmatch(last):
         return host
     try:
-        return socket.inet_ntoa(socket.inet_aton(host.rstrip(".")))
+        return socket.inet_ntoa(socket.inet_aton(host))
     except (OSError, ValueError):
-        return host
+        return None
 
 
 @dataclass(frozen=True)
@@ -187,10 +188,22 @@ def validate_base_url(
     resolves to a private IP (DNS rebinding) passes. In a sensitive environment keep the
     whitelist (default) or check egress at the network edge.
     """
-    if url is None or url.strip() == "":
+    if url is None or (isinstance(url, str) and url.strip() == ""):
         return UrlValidationResult(True, sanitized_url=DEFAULT_BASE_URL)
+    if not isinstance(url, str):
+        return UrlValidationResult(False, "Invalid URL format")
+    text = url.strip()
+    # The TS client validates with the WHATWG URL parser, and the server (Node) parses the URL the
+    # same way. Python's `urlsplit` does not, so the differences that matter for SSRF are
+    # reproduced here, before any check:
+    #  - for http(s), `\` is a path separator (`https://169.254.169.254\@public.com/` is host
+    #    169.254.169.254, not public.com);
+    #  - the host is percent-decoded and mapped to ASCII with IDNA, so full-width letters/digits
+    #    and the ideographic dots (`127。0。0。1`, `ｌｏｃａｌｈｏｓｔ`) become the host they resolve to.
+    if re.match(r"(?i)https?:", text):
+        text = text.replace("\\", "/")
     try:
-        parts = urlsplit(url.strip())
+        parts = urlsplit(text)
         scheme = parts.scheme.lower()
         raw_host = parts.hostname  # lowercased, brackets removed
         port = parts.port  # raises ValueError on an invalid port
@@ -198,12 +211,23 @@ def validate_base_url(
         return UrlValidationResult(False, "Invalid URL format")
     if not scheme or not raw_host:
         return UrlValidationResult(False, "Invalid URL format")
+    raw_host = unquote(raw_host)
+    if ":" not in raw_host:  # IPv6 literals are already ASCII
+        try:
+            raw_host = raw_host.encode("idna").decode("ascii").lower()
+            # Punycode labels must decode (WHATWG rejects `xn--llm-zihin-ai`).
+            raw_host.encode("ascii").decode("idna")
+        except UnicodeError:
+            return UrlValidationResult(False, "Invalid URL format")
 
     # Trailing dot: `localhost.` and `metadata.google.internal.` are valid FQDNs that resolve to the
     # same host but would escape the block list by string equality. It is also dropped from the
     # effective URL: a Host/SNI with a trailing dot can fail certificate validation.
     hostname = raw_host.rstrip(".") if len(raw_host) > 1 and raw_host.endswith(".") else raw_host
-    hostname = _normalize_ipv4(hostname)
+    normalized = _normalize_ipv4(hostname)
+    if normalized is None:
+        return UrlValidationResult(False, "Invalid URL format")
+    hostname = normalized
     path = parts.path or ""
 
     is_localhost = hostname in ("localhost", "127.0.0.1", "::1")

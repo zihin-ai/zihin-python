@@ -4,6 +4,7 @@ from ._client import Zihin
 from ._errors import ZihinError, is_commercial_block
 from ._http import RetryInfo
 from ._invoke import (
+    AgentStream,
     classify_stream_error_kind,
     error_from_done_event,
     error_from_outcome,
@@ -27,6 +28,7 @@ from ._types import (
 __version__ = "0.2.0"
 
 __all__ = [
+    "AgentStream",
     "Agent",
     "AgentOutcome",
     "AgentResult",

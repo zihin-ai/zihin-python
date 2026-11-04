@@ -35,6 +35,11 @@ def _q(value: str) -> str:
     return quote(value, safe="")
 
 
+def _require_id(value: Any, name: str) -> None:
+    if not isinstance(value, str) or not value:
+        raise ZihinError("config", f"{name} is required (a non-empty string).")
+
+
 #: Statuses that mean "still running". The NON-terminal ones are listed on purpose: any new value
 #: the server starts recording is treated as terminal, and polling STOPS instead of spinning forever.
 _RUNNING_STATUSES = {
@@ -70,6 +75,8 @@ def _query_extraction_body(extraction: Optional[Mapping[str, Any]], query_field:
 
 def _check_callback_url(url: Optional[str]) -> None:
     # The callback URL is registered on the server, which calls it: HTTPS + no private IP.
+    if url is not None and not isinstance(url, str):
+        raise ZihinError("config", "callback_url must be a string.")
     if url:
         check = validate_base_url(url, allow_custom_domains=True)
         if not check.valid:
@@ -89,10 +96,8 @@ def create_trigger(
     dispatch_auth: str = "api_key",
     response_transform: Optional[str] = None,
 ) -> TriggerRef:
-    if not agent_id:
-        raise ZihinError("config", "agent_id is required.")
-    if not name:
-        raise ZihinError("config", "name is required.")
+    _require_id(agent_id, "agent_id")
+    _require_id(name, "name")
     if mode == "async" and not callback_url:
         raise ZihinError("config", "callback_url is required for async triggers.")
     _check_callback_url(callback_url)
@@ -170,8 +175,7 @@ def list_triggers(
 
 
 def get_trigger(t: Transport, trigger_id: str) -> TriggerInfo:
-    if not trigger_id:
-        raise ZihinError("config", "trigger_id is required.")
+    _require_id(trigger_id, "trigger_id")
     j = t.request_json("GET", f"/api/triggers/{_q(trigger_id)}", policy="idempotent")
     data = _d(j).get("data")
     return _trigger_info(t, data if data is not None else j)
@@ -193,8 +197,7 @@ def update_trigger(
     """PATCH /api/triggers/:id. The server REPLACES ``trigger_config`` entirely, so when a config
     field changes the current config is read (GET) and merged before the PATCH. A concurrent write
     in the GET->PATCH window can be overwritten; acceptable for integration reconfiguration."""
-    if not trigger_id:
-        raise ZihinError("config", "trigger_id is required.")
+    _require_id(trigger_id, "trigger_id")
     _check_callback_url(callback_url)
     body: Dict[str, Any] = {}
     if name is not None:
@@ -259,8 +262,7 @@ def update_trigger(
 
 def delete_trigger(t: Transport, trigger_id: str) -> bool:
     """Delete a trigger (admin/owner key; editor gets 403). Returns whether it was deleted."""
-    if not trigger_id:
-        raise ZihinError("config", "trigger_id is required.")
+    _require_id(trigger_id, "trigger_id")
     status, text, endpoint, attempts = t.request_buffered(
         "DELETE",
         f"{t.base_url}/api/triggers/{_q(trigger_id)}",
@@ -275,10 +277,8 @@ def delete_trigger(t: Transport, trigger_id: str) -> bool:
 def find_or_create_trigger(t: Transport, agent_id: str, name: str, **kwargs: Any) -> FindOrCreateResult:
     """Reuse a trigger of the same agent + name, or create one (the server has no name
     uniqueness). A same-name trigger with a different config is REUSED as is."""
-    if not agent_id:
-        raise ZihinError("config", "agent_id is required.")
-    if not name:
-        raise ZihinError("config", "name is required.")
+    _require_id(agent_id, "agent_id")
+    _require_id(name, "name")
     match = next((x for x in list_triggers(t, agent_id=agent_id) if x.name == name), None)
     if match and match.id:
         url = match.webhook_url or f"{t.base_url}/api/triggers/webhook/{match.id}"
@@ -290,8 +290,7 @@ def find_or_create_trigger(t: Transport, agent_id: str, name: str, **kwargs: Any
 def dispatch_agent(t: Transport, trigger_id: str, payload: Optional[Mapping[str, Any]] = None) -> DispatchResult:
     """Fire a trigger. Async returns ``accepted`` + ``execution_id`` (202); sync also returns
     ``agent_response``/``usage``/``outcome`` (200)."""
-    if not trigger_id:
-        raise ZihinError("config", "trigger_id is required.")
+    _require_id(trigger_id, "trigger_id")
     status, text, endpoint, attempts = t.request_buffered(
         "POST",
         f"{t.base_url}/api/triggers/webhook/{_q(trigger_id)}",
@@ -345,8 +344,8 @@ def dispatch_agent(t: Transport, trigger_id: str, payload: Optional[Mapping[str,
 
 def get_execution(t: Transport, trigger_id: str, execution_id: str) -> ExecutionStatus:
     """Status/result of a trigger execution; poll until ``terminal``."""
-    if not trigger_id or not execution_id:
-        raise ZihinError("config", "trigger_id and execution_id are required.")
+    _require_id(trigger_id, "trigger_id")
+    _require_id(execution_id, "execution_id")
     j = _d(t.request_json("GET", f"/api/triggers/{_q(trigger_id)}/executions/{_q(execution_id)}", policy="idempotent"))
     # The server nests under the `data` envelope: { success, data: { execution, metrics } }.
     data = _d(j.get("data"))

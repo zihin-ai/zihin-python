@@ -22,7 +22,9 @@ October 2026). Minor because behaviour changes: turns that used to return now ra
   `attempts` and `timeout_clock`; messages redact API keys, Bearer tokens and stack traces.
 - `base_url` must be a Zihin domain unless `allow_custom_base_url=True`; `http://` requires
   `allow_http=True`; private, loopback and link-local addresses are refused (IPv6 by range).
-- Redirects are rejected instead of followed.
+- Redirects are rejected instead of followed: a 3xx raises `network` with `retryable=False` and is
+  never retried. **Conscious divergence from the Node.js client**, where `redirect: 'error'` makes
+  fetch throw a retryable `network` error that a GET retries.
 - API key format checked as `zhn_(live|test|dev)_[A-Za-z0-9]{20,}`.
 - Retry policy: GET retries network errors, 408, 429 and 5xx; POST retries only 429/503 (with
   `Retry-After`); with `client_message_id`, the stream POST also retries network errors/5xx before
@@ -33,6 +35,12 @@ October 2026). Minor because behaviour changes: turns that used to return now ra
 - A stream that ends without `done` and without `response` returns the tokens with
   `content_source="tokens"` instead of raising.
 - Unrecognized stream events have `type="unknown"`.
+- `stream_agent` returns an `AgentStream`: an iterator with `close()` and context-manager support,
+  so the connection (and the turn) can be closed deterministically. A bare `break` out of a `for`
+  loop does not close it until garbage collection.
+- `AgentResult` field order changed (`content_source` is now the second field and others were
+  inserted): construct it by keyword. `kw_only` dataclasses need Python 3.10, so it is not enforced.
+- Attachments require `type`; it is never sent as `null`.
 
 ### Added
 
@@ -53,6 +61,14 @@ October 2026). Minor because behaviour changes: turns that used to return now ra
   `get_execution`.
 - Exported helpers: `error_from_stream_event`, `error_from_done_event`, `error_from_outcome`,
   `classify_stream_error_kind`, `is_commercial_block`.
+- SSRF check reads hosts like WHATWG (`\` as path separator, percent-decoding, IDNA mapping of
+  full-width characters and ideographic dots, invalid IPv4/punycode rejected), for the base URL,
+  attachments and callback URLs.
+- Total deadline enforced by a watchdog that shuts the socket down when it expires (httpx timeouts
+  are per read); error bodies on the stream path are read with a 64 KiB cap inside the deadline.
+- No raw httpx/idna exception escapes: invalid URLs and non-string ids raise `config`, unexpected
+  transport failures raise `network` (not retryable).
+- SSE decoding drops a leading BOM; `ZihinError` pickles.
 - `Agent.tools_count`; SSE size limits (`max_stream_event_bytes`, `max_stream_total_bytes`);
   `on_retry` hook; `Literal` types for kinds and outcomes.
 

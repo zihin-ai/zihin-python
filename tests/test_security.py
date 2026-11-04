@@ -117,3 +117,64 @@ def test_validate_base_url_result():
     assert validate_base_url("").sanitized_url == "https://llm.zihin.ai"
     assert not validate_base_url("https://[fc00::1]", allow_custom_domains=True).valid
     assert validate_base_url("https://[2001:db8::1]", allow_custom_domains=True).valid
+
+
+# The TS client validates with the WHATWG URL parser and the server reads the URL the same way;
+# each of these resolves to a private/blocked host there, so all must be refused here too.
+WHATWG_BYPASSES = [
+    "https://localhost。",
+    "https://metadata.google.internal。",
+    "https://127。0。0。1",
+    "https://ｌｏｃａｌｈｏｓｔ",
+    "https://０x7f.1",
+    "https://169.254.169.254\\@public.com/",
+    "https://127。0。0。1/",
+    "https://%31%32%37.0.0.1/",
+    "https://xn--llm-zihin-ai.com",
+    "https://1.2.3.256/",
+]
+
+
+@pytest.mark.parametrize("url", WHATWG_BYPASSES)
+def test_whatwg_host_tricks_are_refused_as_custom_base_url(url):
+    with pytest.raises(ZihinError) as exc:
+        Zihin(KEY, base_url=url, allow_custom_base_url=True)
+    assert exc.value.kind == "config"
+
+
+@pytest.mark.parametrize("url", WHATWG_BYPASSES)
+def test_whatwg_host_tricks_are_refused_as_attachment(url):
+    rec = Recorder(httpx.Response(200))
+    with pytest.raises(ZihinError) as exc:
+        make_client(rec).invoke_agent("a", "Hi", attachments=[{"url": url, "type": "image"}])
+    assert exc.value.kind == "config" and rec.requests == []
+
+
+@pytest.mark.parametrize("url", WHATWG_BYPASSES)
+def test_whatwg_host_tricks_are_refused_as_callback_url(url):
+    rec = Recorder(httpx.Response(201, json={"data": {"id": "t"}}))
+    with pytest.raises(ZihinError) as exc:
+        make_client(rec).create_trigger("ag", "n", callback_url=url)
+    assert exc.value.kind == "config" and rec.requests == []
+    with pytest.raises(ZihinError) as exc:
+        make_client(rec).update_trigger("t", callback_url=url)
+    assert exc.value.kind == "config" and rec.requests == []
+
+
+def test_idna_host_is_mapped_like_whatwg():
+    # U+24DB maps to "l" under IDNA, as in WHATWG: the effective host is the ASCII one.
+    z = Zihin(KEY, base_url="https://ⓛlm.example.com", allow_custom_base_url=True)
+    assert z.base_url == "https://llm.example.com"
+    assert validate_base_url("https://LLM.zihin.ai").sanitized_url == "https://llm.zihin.ai"
+
+
+def test_zihin_error_pickles():
+    import pickle
+
+    err = ZihinError("blocked", "refused", code="REFUSED", status=200, request_id="r-1", attempts=2, retryable=False)
+    back = pickle.loads(pickle.dumps(err))
+    assert type(back) is ZihinError
+    assert (back.kind, back.code, back.status, back.request_id, back.retryable, back.message) == (
+        err.kind, err.code, err.status, err.request_id, err.retryable, err.message
+    )
+    assert str(back) == str(err)
