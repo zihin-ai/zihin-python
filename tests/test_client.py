@@ -1,4 +1,4 @@
-"""Offline tests: every request is answered by an httpx MockTransport."""
+"""The 0.1.0 suite, adapted to 0.2.0 where the contract changed (see comments)."""
 
 import json
 
@@ -8,18 +8,7 @@ import pytest
 from zihin import Zihin, ZihinError
 from zihin._sse import parse_sse
 
-KEY = "zhn_test_" + "x" * 16
-
-
-def sse(*events):
-    out = []
-    for name, data in events:
-        out.append(f"event: {name}\ndata: {json.dumps(data)}\n\n")
-    return "".join(out).encode()
-
-
-def client(handler):
-    return Zihin(KEY, http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+from conftest import KEY, make_client as client, sse
 
 
 def test_requires_api_key(monkeypatch):
@@ -46,11 +35,14 @@ def test_list_agents_sends_key_and_maps_fields():
     def handler(request):
         seen["url"] = str(request.url)
         seen["key"] = request.headers.get("x-api-key")
-        return httpx.Response(200, json={"data": [{"id": "a1", "name": "Support", "commercial_name": "Ana", "tags": ["x", 3]}]})
+        return httpx.Response(
+            200, json={"data": [{"id": "a1", "name": "Support", "commercial_name": "Ana", "tags": ["x", 3], "tools_count": 4}]}
+        )
 
     agents = client(handler).list_agents()
     assert seen == {"url": "https://llm.zihin.ai/api/v2/agents", "key": KEY}
     assert agents[0].id == "a1" and agents[0].commercial_name == "Ana" and agents[0].tags == ["x"]
+    assert agents[0].tools_count == 4
 
 
 def test_list_agents_maps_401_to_auth():
@@ -80,16 +72,20 @@ def test_invoke_agent_consolidates_response_and_metrics():
     assert seen["url"] == "https://llm.zihin.ai/api/v2/agents/agent%2F1/stream"
     assert seen["body"] == {"message": "Hi", "session_id": "s-0"}
     assert result.content == "Hello!"
+    assert result.content_source == "response"
     assert result.session_id == "s-1"
     assert (result.model, result.execution_id, result.outcome) == ("m-1", "e-1", "COMPLETED")
     assert (result.usage.input_tokens, result.usage.output_tokens, result.usage.cost_usd) == (10, 2, 0.001)
 
 
 def test_invoke_agent_raises_on_error_event():
+    # 0.2.0: the `agent` kind is gone. An unknown in-stream code is classified like the TS core
+    # (`server`, not retryable); known codes get their own kind (see test_invoke.py).
     body = sse(("token", {"content": "partial"}), ("error", {"error": {"code": "ENGINE_ERROR", "message": "boom", "request_id": "r-1"}}))
     with pytest.raises(ZihinError) as exc:
         client(lambda r: httpx.Response(200, content=body)).invoke_agent("a", "Hi")
-    assert (exc.value.kind, exc.value.code, exc.value.request_id) == ("agent", "ENGINE_ERROR", "r-1")
+    assert (exc.value.kind, exc.value.code, exc.value.request_id) == ("server", "ENGINE_ERROR", "r-1")
+    assert exc.value.retryable is False
 
 
 def test_invoke_agent_raises_timeout_even_with_a_response_event():
@@ -122,15 +118,23 @@ def test_stream_agent_yields_events_in_order():
     assert "".join(e.content for e in events if e.type == "token") == "Hello"
 
 
-def test_network_failure_is_reported_as_network():
+def test_network_failure_is_reported_as_network(no_sleep):
+    calls = []
+
     def handler(request):
+        calls.append(request)
         raise httpx.ConnectError("refused")
 
     with pytest.raises(ZihinError) as exc:
         client(handler).list_agents()
     assert exc.value.kind == "network"
+    # 0.2.0: GET is idempotent, so a network error is retried (default max_retries=2).
+    assert len(calls) == 3 and len(no_sleep) == 2
 
 
 def test_parse_sse_handles_comments_multiline_data_and_plain_text():
+    # 0.2.0: the parser consumes raw byte chunks (to enforce size limits) instead of text lines.
     lines = [": keep-alive", "event: a", 'data: {"x":', "data: 1}", "", "data: plain", "", "event: empty", ""]
-    assert list(parse_sse(lines)) == [("a", {"x": 1}), ("message", "plain")]
+    raw = "\n".join(lines).encode()
+    chunks = [raw[i : i + 7] for i in range(0, len(raw), 7)]
+    assert list(parse_sse(chunks)) == [("a", {"x": 1}), ("message", "plain")]
