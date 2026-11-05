@@ -333,3 +333,7 @@ The tests are offline: every request is answered by an `httpx.MockTransport`.
 ## License
 
 MIT
+
+---
+
+Made by [Zihin.ai](https://www.zihin.ai). If this project is useful to you, a ⭐ helps others find it.
