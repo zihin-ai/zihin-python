@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 (2026-11-09)
+
+- Exclude tests and development notes from source distributions.
+- Validate wheel and source archive contents before publishing.
+- Use English test fixtures in the public repository.
+
 ## 0.2.0 (2026-11-04)
 
 Contract parity with the Node.js client `@zihin/agent-client` 0.7.0 (server `server-llm` of
