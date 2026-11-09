@@ -25,6 +25,7 @@ jobs:
           version="$(python -c 'import zihin; print(zihin.__version__)')"
           test "v${version}" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != v${version}"; exit 1; }
       - run: python -m build
+      - run: python scripts/check-publication.py
       - uses: actions/upload-artifact@v4
         with:
           name: dist

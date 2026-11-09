@@ -104,7 +104,7 @@ def test_dispatch_async_202():
     [("TIMEOUT", "timeout", "TURN_TIMEOUT"), ("REFUSED", "blocked", "REFUSED"), ("CONTEXT_LIMIT", "blocked", "CONTEXT_LIMIT"), ("ERROR", "server", "ERROR"), ("SESSION_BUSY", "blocked", "SESSION_BUSY")],
 )
 def test_dispatch_success_true_with_bad_outcome_raises(outcome, kind, code):
-    body = {"success": True, "outcome": outcome, "agent_response": "Não consigo ajudar com esse pedido.", "execution_id": "x-3"}
+    body = {"success": True, "outcome": outcome, "agent_response": "I cannot help with that request.", "execution_id": "x-3"}
     with pytest.raises(ZihinError) as exc:
         make_client(Recorder(httpx.Response(200, json=body))).dispatch_agent("t-1", {"message": "hi"})
     assert (exc.value.kind, exc.value.code, exc.value.status, exc.value.execution_id) == (kind, code, 200, "x-3")

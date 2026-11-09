@@ -178,7 +178,7 @@ def test_gated_turn_without_metadata_does_not_require_the_check():
     ],
 )
 def test_failed_outcomes_raise_instead_of_returning_the_neutral_text(outcome, kind, code, retryable):
-    neutral = "Não consigo ajudar com esse pedido."
+    neutral = "I cannot help with that request."
     err = raises(
         [
             ("metadata", {"execution_id": "e-7", "session_id": "s-7"}),
